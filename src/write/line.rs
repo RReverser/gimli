@@ -966,6 +966,24 @@ mod convert {
     use crate::read::{self, Reader};
     use crate::write::{self, ConvertError, ConvertResult};
 
+    fn sub_address(addr: Address, base: Address) -> ConvertResult<u64> {
+        Ok(match (addr, base) {
+            (Address::Constant(addr), Address::Constant(base)) => addr - base,
+            // Only support relative addresses within same relocatable symbol.
+            // TODO: we could probably instead end current sequence & start a new one
+            // when this happens, but it's unclear if it's ever useful to do so
+            // (perhaps when transformation inlined one relocatable function into another?).
+            (
+                Address::Symbol { symbol, addend },
+                Address::Symbol {
+                    symbol: base_symbol,
+                    addend: base_addend,
+                },
+            ) if symbol == base_symbol => (addend - base_addend) as u64,
+            _ => return Err(ConvertError::InvalidAddress),
+        })
+    }
+
     impl LineProgram {
         /// Create a line number program by reading the data from the given program.
         ///
@@ -1072,10 +1090,7 @@ mod convert {
                         if program.in_sequence() {
                             return Err(ConvertError::UnsupportedLineInstruction);
                         }
-                        match convert_address(val) {
-                            Some(val) => address = Some(val),
-                            None => return Err(ConvertError::InvalidAddress),
-                        }
+                        address = convert_address(val);
                         from_row.execute(read::LineInstruction::SetAddress(0), &mut from_program);
                     }
                     read::LineInstruction::DefineFile(_) => {
@@ -1085,12 +1100,31 @@ mod convert {
                         if from_row.execute(instruction, &mut from_program) {
                             if !program.in_sequence() {
                                 program.begin_sequence(address);
-                                address = None;
                             }
+                            // End of sequence usually doesn't have direct mapping; instead,
+                            // pass pos+1 for the next instruction and then subtract that 1 back.
+                            let offset = if from_row.end_sequence() { 1 } else { 0 };
+                            let row_addr = match convert_address(from_row.address() + offset) {
+                                Some(addr) => Some(
+                                    sub_address(
+                                        addr,
+                                        // By now we should have a base address for the sequence.
+                                        address.ok_or(ConvertError::InvalidAddress)?,
+                                    )? - offset,
+                                ),
+                                None => None,
+                            };
                             if from_row.end_sequence() {
-                                program.end_sequence(from_row.address());
+                                // Can't end sequence without a valid address.
+                                program.end_sequence(row_addr.ok_or(ConvertError::InvalidAddress)?);
+                                address = None;
                             } else {
-                                program.row().address_offset = from_row.address();
+                                program.row().address_offset = match row_addr {
+                                    Some(row_addr) => row_addr,
+                                    // For other instructions, if conversion returned None, just
+                                    // skip this line as it's no longer valid.
+                                    None => continue,
+                                };
                                 program.row().op_index = from_row.op_index();
                                 program.row().file = {
                                     let file = from_row.file_index();
